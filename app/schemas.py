@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Annotated, Literal, Optional, Union
 
 from pydantic import BaseModel, Field, StrictBool, StrictStr, field_validator, model_validator
@@ -1038,4 +1039,85 @@ class ExportZoneResponse(BaseModel):
         description="BIND zone fragment (starts with $ORIGIN/$TTL); "
         "re-importing it via /v1/records/import-zone reproduces the "
         "normalized records in their original order",
+    )
+
+
+class CheckOCSPRequest(BaseModel):
+    """Leaf/issuer PEM certificates, a Base64 DER OCSP response and the
+    UTC verification instant for an offline OCSP check."""
+
+    leaf_certificate: StrictStr = Field(
+        ..., min_length=1, description="PEM-encoded leaf (end-entity) certificate"
+    )
+    issuer_certificate: StrictStr = Field(
+        ..., min_length=1, description="PEM-encoded issuer certificate"
+    )
+    ocsp_response: StrictStr = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Base64-encoded DER OCSP response (standard alphabet, whitespace "
+            "allowed); at most 64 KiB after decoding"
+        ),
+    )
+    verification_time: datetime = Field(
+        ...,
+        description=(
+            "UTC instant at which the response is evaluated; must carry a "
+            "timezone designator (e.g. '2026-01-01T00:00:00Z')"
+        ),
+    )
+
+    @field_validator("verification_time")
+    @classmethod
+    def _require_timezone(cls, v: datetime) -> datetime:
+        if v.tzinfo is None or v.utcoffset() is None:
+            raise ValueError(
+                "verification_time must be timezone-aware (use a 'Z' suffix "
+                "or an explicit UTC offset)"
+            )
+        return v
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "leaf_certificate": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n",
+                    "issuer_certificate": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n",
+                    "ocsp_response": "MIIFzBA...",
+                    "verification_time": "2026-01-02T12:00:00Z",
+                }
+            ]
+        }
+    }
+
+
+class CheckOCSPResponse(BaseModel):
+    verified: StrictBool = Field(
+        ...,
+        description=(
+            "True only when the response is successful, carries exactly one "
+            "SingleResponse for the supplied leaf, is signed by the supplied "
+            "issuer, and is fresh at verification_time"
+        ),
+    )
+    reason: StrictStr = Field(..., description="Human-readable verification conclusion")
+    cert_status: Optional[Literal["good", "revoked", "unknown"]] = Field(
+        None,
+        description="Certificate status (good/revoked/unknown); null when not verified",
+    )
+    produced_at: Optional[str] = Field(
+        None, description="OCSP producedAt as RFC 3339 UTC; null when not verified"
+    )
+    this_update: Optional[str] = Field(
+        None, description="SingleResponse thisUpdate as RFC 3339 UTC; null when not verified"
+    )
+    next_update: Optional[str] = Field(
+        None, description="SingleResponse nextUpdate as RFC 3339 UTC; null when absent/not verified"
+    )
+    revocation_time: Optional[str] = Field(
+        None, description="Revocation time as RFC 3339 UTC for revoked certs; null otherwise"
+    )
+    revocation_reason: Optional[str] = Field(
+        None, description="CRL/OCSP revocation reason name for revoked certs; null otherwise"
     )

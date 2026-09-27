@@ -1,7 +1,8 @@
 """FastAPI application exposing POST /v1/authorize, /v1/authorize/patch-plan,
 /v1/authorize/change-impact, /v1/authorize/rollout-window,
 /v1/issuance/route, /v1/issuance/check-csr, /v1/issuance/check-dns01,
-/v1/records/import-zone, /v1/records/export-zone and /v1/records/minimize."""
+/v1/issuance/check-ocsp, /v1/records/import-zone, /v1/records/export-zone
+and /v1/records/minimize."""
 
 from __future__ import annotations
 
@@ -20,6 +21,7 @@ from .engine import (
     rollout_window,
     route_issuance,
 )
+from .ocsp import verify_ocsp
 from .schemas import (
     AuthorizeRequest,
     AuthorizeResponse,
@@ -29,6 +31,8 @@ from .schemas import (
     CheckCSRResponse,
     CheckDNS01Request,
     CheckDNS01Response,
+    CheckOCSPRequest,
+    CheckOCSPResponse,
     ExportZoneRequest,
     ExportZoneResponse,
     ImportZoneRequest,
@@ -58,8 +62,9 @@ app = FastAPI(
 async def caa_error_handler(_: Request, exc: CAAError) -> JSONResponse:
     # All engine-level failures (bad names, mixed RRs, multiple CNAMEs,
     # alias loops, >8 hops), CSR parse/signature/SAN failures, JWK/token
-    # failures and zone-import failures are client errors and map to
-    # HTTP 422. Zone-import errors additionally carry the source line.
+    # failures, OCSP PEM/DER/algorithm failures and zone-import failures
+    # are client errors and map to HTTP 422. Zone-import errors additionally
+    # carry the source line.
     content: dict = {"detail": str(exc), "error_type": exc.__class__.__name__}
     line = getattr(exc, "line", None)
     if line is not None:
@@ -194,6 +199,22 @@ async def issuance_check_dns01(payload: CheckDNS01Request) -> CheckDNS01Response
         records=[r.model_dump() for r in payload.records],
     )
     return CheckDNS01Response(**result)
+
+
+@app.post(
+    "/v1/issuance/check-ocsp",
+    response_model=CheckOCSPResponse,
+    tags=["caa"],
+    summary="Offline-verify a Base64 DER OCSP response for a leaf/issuer pair",
+)
+async def issuance_check_ocsp(payload: CheckOCSPRequest) -> CheckOCSPResponse:
+    verdict = verify_ocsp(
+        leaf_pem=payload.leaf_certificate,
+        issuer_pem=payload.issuer_certificate,
+        response_b64=payload.ocsp_response,
+        verification_time=payload.verification_time,
+    )
+    return CheckOCSPResponse(**verdict.__dict__)
 
 
 @app.post(
