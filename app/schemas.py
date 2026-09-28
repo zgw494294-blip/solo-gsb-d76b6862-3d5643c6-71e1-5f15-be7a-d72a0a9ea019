@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Annotated, Literal, Optional, Union
 
 from pydantic import BaseModel, Field, StrictBool, StrictStr, field_validator, model_validator
@@ -1038,4 +1039,88 @@ class ExportZoneResponse(BaseModel):
         description="BIND zone fragment (starts with $ORIGIN/$TTL); "
         "re-importing it via /v1/records/import-zone reproduces the "
         "normalized records in their original order",
+    )
+
+
+class CheckOCSPRequest(BaseModel):
+    """Leaf/issuer PEM certificates, a Base64-DER OCSP response and the
+    timezone-aware UTC instant at which freshness is evaluated."""
+
+    leaf_certificate: str = Field(
+        ...,
+        min_length=1,
+        description="PEM-encoded leaf certificate; exactly one CERTIFICATE "
+        "block, at most 64 KiB (65536 UTF-8 bytes)",
+    )
+    issuer_certificate: str = Field(
+        ...,
+        min_length=1,
+        description="PEM-encoded issuer certificate; exactly one CERTIFICATE "
+        "block, at most 64 KiB (65536 UTF-8 bytes)",
+    )
+    ocsp_response: str = Field(
+        ...,
+        min_length=1,
+        description="Standard Base64-encoded DER OCSPResponse (RFC 6960); "
+        "at most 64 KiB (65536 UTF-8 bytes)",
+    )
+    verification_time: datetime = Field(
+        ...,
+        description="UTC verification instant (timezone-aware, e.g. "
+        "'2026-09-28T12:00:00Z'); producedAt/thisUpdate must not be later "
+        "and nextUpdate must not be past at this instant",
+    )
+
+    @field_validator("verification_time")
+    @classmethod
+    def _require_aware_utc(cls, v: datetime) -> datetime:
+        if v.tzinfo is None or v.utcoffset() is None:
+            raise ValueError(
+                "verification_time must be timezone-aware UTC (e.g. "
+                "'2026-09-28T12:00:00Z'), not a naive datetime"
+            )
+        return v.astimezone(timezone.utc)
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "leaf_certificate": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n",
+                    "issuer_certificate": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n",
+                    "ocsp_response": "MIIF...AA==",
+                    "verification_time": "2026-09-28T12:00:00Z",
+                }
+            ]
+        }
+    }
+
+
+class CheckOCSPResponse(BaseModel):
+    verified: bool = Field(
+        ...,
+        description=(
+            "True only when the response is successful, carries exactly "
+            "one SingleResponse for the leaf/issuer CertID, is signed by "
+            "the issuer key (RSA/ECDSA) and is fresh at verification_time"
+        ),
+    )
+    reason: str
+    status: Optional[Literal["good", "revoked", "unknown"]] = Field(
+        None,
+        description="Certificate status from the SingleResponse; null on a "
+        "response that does not verify",
+    )
+    produced_at: Optional[datetime] = Field(
+        None, description="producedAt (UTC); null unless verified"
+    )
+    this_update: Optional[datetime] = Field(
+        None, description="thisUpdate (UTC); null unless verified"
+    )
+    next_update: Optional[datetime] = Field(
+        None, description="nextUpdate (UTC); null unless verified"
+    )
+    revocation_time: Optional[datetime] = Field(
+        None,
+        description="revocationTime (UTC) when status is revoked; otherwise "
+        "null",
     )

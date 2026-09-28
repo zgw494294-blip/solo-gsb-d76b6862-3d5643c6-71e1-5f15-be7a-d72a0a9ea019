@@ -13,6 +13,11 @@ CN 兜底），按 SAN 顺序逐个套用同一套 CAA 判定并共享一次记�
 按 RFC 7638 计算 JWK thumbprint，在精确名 `_acme-challenge.<domain>` 上（通配符与普通挑战同名、
 domain 不含 `*`）比较 `base64url(SHA-256(token.thumbprint))`；TXT 的 chunks 按序拼接逐 RR 比对，
 CNAME 仅精确跟随、不上溯、限 8 跳、成环即拒。
+`POST /v1/issuance/check-ocsp` 则离线核验证书的 **OCSP** 状态（RFC 6960）：提交叶证书、签发者
+证书的 PEM、Base64 DER 响应与 UTC 校验时刻；只接受 `successful` 且恰含一个 SingleResponse 的响应，
+核对叶证书 issuer 与序列号、按响应指定哈希算法用签发者重算 CertID（issuerNameHash /
+issuerKeyHash），要求响应者就是该签发者（byName 或 byKey）并用 RSA（PKCS#1 v1.5）或 ECDSA
+验签，再检查 producedAt / thisUpdate / nextUpdate 的时效。
 `POST /v1/authorize/change-impact` 可提交一批删除 / 新增编辑，审查它们会翻转哪些查询的签发许可，
 并为每个翻转给出可重现新版判定的最小编辑子集。
 `POST /v1/records/minimize` 则只删不增：在保持所有提交查询的 `authorized` 与 `effective_owner`
@@ -627,6 +632,128 @@ curl -s -X POST http://localhost:8080/v1/issuance/check-dns01 \
 "error_type":"InvalidJWKError"}`；token 非法、domain 含 `*`、id 重复、同名 TXT/CNAME、多条 CNAME、
 CNAME 成环或超过 8 跳同样返回 422；TXT 缺失 / 不匹配则 HTTP 200 且对应项 `valid=false`。
 
+### `POST /v1/issuance/check-ocsp`
+
+证书签发 / 受理前的 **OCSP（RFC 6960）离线核验**：调用方自带叶证书、签发者证书与一份此前从 CA
+获取的 Base64 DER OCSP 响应，服务不发起任何网络请求，只在**给定的签发者证书**范围内核验该响应
+是否真实、匹配且未过期。**不建立任何证书链信任**，也不校验证书有效期等其他内容——结论仅针对
+所提交的签发者。
+
+请求体：
+
+| 字段                | 类型   | 必填 | 说明                                                                     |
+| ------------------- | ------ | ---- | ------------------------------------------------------------------------ |
+| `leaf_certificate`  | string | 是   | 叶证书 PEM，必须恰好含一个 `CERTIFICATE` 块，不超过 64 KiB（65536 字节）  |
+| `issuer_certificate`| string | 是   | 签发者证书 PEM，必须恰好含一个 `CERTIFICATE` 块，不超过 64 KiB           |
+| `ocsp_response`     | string | 是   | 标准 Base64（含填充）编码的 DER `OCSPResponse`，不超过 64 KiB             |
+| `verification_time` | string | 是   | **带时区的** UTC 校验时刻（RFC 3339，如 `2026-09-28T12:00:00Z`）；无时区拒绝 |
+
+核验规则（按顺序执行）：
+
+1. **响应状态**：DER 解析后 `responseStatus` 必须为 `successful(0)`；`malformedRequest` /
+   `internalError` / `tryLater` 等非成功状态返回 HTTP 200、`verified=false` 并说明状态。
+2. **恰含一个 SingleResponse**：成功响应的 `responses` 必须**恰好有 1** 条；0 条或多条均为
+   `verified=false`。
+3. **叶证书 issuer**：叶证书的 issuer DN 必须与提交的签发者证书 subject DN 的 DER 完全相等。
+4. **序列号**：SingleResponse 中 `CertID.serialNumber` 必须等于叶证书序列号。
+5. **重算 CertID**：用**响应中指定的哈希算法**（取自 CertID）对签发者证书的 subject DN DER 求
+   issuerNameHash、对签发者公钥（SubjectPublicKeyInfo 中 BIT STRING 的内容，即 RSA 的
+   RSAPublicKey / EC 的 ECPoint）求 issuerKeyHash，两者都必须与响应中的 CertID 逐字节相等。
+6. **响应者必须就是该签发者**：responder ID 为 `byName` 时其 Name 必须等于签发者 subject；
+   为 `byKey` 时其 SHA-1 keyHash 必须等于签发者公钥的上述公钥字节 SHA-1。委托响应者
+   （delegated responder）一律不信任。
+7. **签名**：用签发者公钥验证 `tbsResponseData` 上的签名，仅支持 **RSA PKCS#1 v1.5** 与
+   **ECDSA**；RSA-PSS 及其他 / 不支持的密钥或签名算法返回 **422**，签名值错误则
+   `verified=false`。
+8. **时效（相对 `verification_time`，UTC）**：`producedAt` 与 `thisUpdate` 不得晚于校验时刻；
+   `nextUpdate` **必须存在**且不得早于校验时刻（边界相等视为有效）。任一不满足即
+   `verified=false`。
+
+响应体：
+
+| 字段                | 说明                                                                       |
+| ------------------- | -------------------------------------------------------------------------- |
+| `verified`          | 上述全部通过才为 `true`                                                    |
+| `reason`            | 人读结论或失败原因                                                         |
+| `status`            | `good` / `revoked` / `unknown`；未通过核验为 `null`                        |
+| `produced_at`       | 响应 producedAt（UTC，RFC 3339）；未通过为 `null`                          |
+| `this_update`       | SingleResponse thisUpdate（UTC）；未通过为 `null`                          |
+| `next_update`       | SingleResponse nextUpdate（UTC）；未通过为 `null`                          |
+| `revocation_time`   | 证书状态为 revoked 时的 revocationTime（UTC）；否则 `null`                  |
+
+`verified=true` 只表示「该签发者在 `verification_time` 时点认可该响应、且响应未过期」，证书当前
+是否被吊销看 `status`（`revoked` / `unknown` 同样可能 `verified=true`）。
+
+示例（先用 Python 生成一对 CA / 叶证书与一份 good 响应，再提交；实际使用时 `ocsp_response`
+一般来自此前对 CA OCSP responder 的查询结果，保存为 Base64 离线提交）：
+
+```python
+import base64, datetime
+from cryptography import x509
+from cryptography.x509 import ocsp
+from cryptography.x509.oid import NameOID
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+
+now = datetime.datetime.now(datetime.timezone.utc)
+ca_key = rsa.generate_private_key(65537, 2048)
+ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "ca.example")])
+ca = (x509.CertificateBuilder().subject_name(ca_name).issuer_name(ca_name)
+      .public_key(ca_key.public_key()).serial_number(1)
+      .not_valid_before(now - datetime.timedelta(days=1))
+      .not_valid_after(now + datetime.timedelta(days=3650))
+      .sign(ca_key, hashes.SHA256()))
+leaf_key = rsa.generate_private_key(65537, 2048)
+leaf = (x509.CertificateBuilder()
+      .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "www.example.com")]))
+      .issuer_name(ca_name).public_key(leaf_key.public_key()).serial_number(0x1234)
+      .not_valid_before(now - datetime.timedelta(days=1))
+      .not_valid_after(now + datetime.timedelta(days=90))
+      .sign(ca_key, hashes.SHA256()))
+resp = (ocsp.OCSPResponseBuilder()
+      .add_response(cert=leaf, issuer=ca, algorithm=hashes.SHA1(),
+                    cert_status=ocsp.OCSPCertStatus.GOOD,
+                    this_update=now - datetime.timedelta(minutes=5),
+                    next_update=now + datetime.timedelta(days=7),
+                    revocation_time=None, revocation_reason=None)
+      .responder_id(ocsp.OCSPResponderEncoding.NAME, ca)
+      .sign(ca_key, hashes.SHA256()))
+payload = {
+    "leaf_certificate": leaf.public_bytes(serialization.Encoding.PEM).decode(),
+    "issuer_certificate": ca.public_bytes(serialization.Encoding.PEM).decode(),
+    "ocsp_response": base64.b64encode(resp.public_bytes(serialization.Encoding.DER)).decode(),
+    "verification_time": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+}
+```
+
+```bash
+jq -n --slurpfile p payload.json '$p[0]' \
+  | curl -s -X POST http://localhost:8080/v1/issuance/check-ocsp \
+      -H 'Content-Type: application/json' -d @-
+```
+
+```json
+{
+  "verified": true,
+  "reason": "OCSP response verified: certificate status is good",
+  "status": "good",
+  "produced_at": "2026-09-28T11:59:00Z",
+  "this_update": "2026-09-28T11:55:00Z",
+  "next_update": "2026-10-05T12:00:00Z",
+  "revocation_time": null
+}
+```
+
+失败示例：提交了另一张 CA 签发的同序列号响应 → HTTP 200，`verified=false`，
+`reason` 为 `CertID issuerNameHash does not match the issuer certificate`；签名被篡改 →
+`OCSP response signature does not verify with the issuer key`；`nextUpdate` 已过 →
+`nextUpdate ... is already past at the verification time ...`，此时 `status` 等字段均为 `null`。
+
+错误请求（**422**，`error_type=OCSPError`）：PEM 无法解析或含多个 / 零个 `CERTIFICATE` 块、
+`ocsp_response` 不是合法标准 Base64 或 DER 无法解析、CertID 指定了无法识别的哈希算法、
+签发者公钥既非 RSA 也非 ECDSA、签名算法为 RSA-PSS 等不支持算法、`verification_time` 为无时区
+时间；证书或响应超过 64 KiB 同样返回 422。
+
 ### `POST /v1/records/import-zone`
 
 把一段 BIND zone 文本解析成**可直接作为 `/v1/authorize` 的 `records` 使用**的 CAA/CNAME
@@ -994,6 +1121,8 @@ app/
   csr.py        # PKCS#10 CSR 解析、签名校验与 SAN DNSName 提取（cryptography）
   dns01.py      # ACME DNS-01 离线核验：RSA JWK 校验、RFC 7638 thumbprint、
               # TXT chunks 按序拼接比对、精确名 CNAME 链（8 跳 / 成环，不上溯）
+  ocsp.py       # OCSP（RFC 6960）离线核验：CertID 重算、byName/byKey 响应者、
+              # RSA PKCS#1 v1.5 / ECDSA 验签、producedAt/thisUpdate/nextUpdate 时效
   zonefile.py   # BIND zone 文本解析与导出（$ORIGIN/$TTL、owner 继承、括号/引号/转义）
   schemas.py    # Pydantic v2 请求/响应模型与输入校验
   main.py       # FastAPI 路由与 422 异常映射
@@ -1001,6 +1130,7 @@ tests/
   test_api.py             # 48 条 authorize / patch-plan 端到端用例
   test_check_csr.py       # 41 条 CSR 受理检查（check-csr）用例
   test_check_dns01.py     # 60 条 ACME DNS-01 离线核验（check-dns01）用例
+  test_check_ocsp.py      # 37 条 OCSP 离线核验（check-ocsp）用例（含 DER 重签 / 拼接）
   test_change_impact.py   # 28 条变更影响审查（change-impact）用例
   test_export_zone.py     # 26 条 zone 导出（export-zone）用例
   test_issuance_route.py  # 24 条批量签发路由用例（pytest + TestClient）
